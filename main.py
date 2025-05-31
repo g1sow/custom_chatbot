@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from groq import Groq
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -18,14 +17,25 @@ app = FastAPI(title="G1SOW Studio RAG Chatbot API", version="1.0.0")
 # CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Groq client
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# Initialize Groq client with error handling
+try:
+    from groq import Groq
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        logger.error("GROQ_API_KEY environment variable not set")
+        client = None
+    else:
+        client = Groq(api_key=groq_api_key)
+        logger.info("Groq client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Groq client: {str(e)}")
+    client = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -36,7 +46,7 @@ class ChatResponse(BaseModel):
     sources: List[str] = []
     conversation_id: str
 
-# Website knowledge base - extracted from your content
+# Website knowledge base
 KNOWLEDGE_BASE = [
     {
         "content": "G1SOW is a digital agency founded in 2025 that specializes in creating exceptional web experiences. We have completed 10+ projects with 98% client satisfaction, have 5 team members, and 2+ years of experience.",
@@ -75,34 +85,47 @@ KNOWLEDGE_BASE = [
     }
 ]
 
-# Initialize TF-IDF vectorizer for similarity search
-vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-knowledge_texts = [item["content"] for item in KNOWLEDGE_BASE]
-tfidf_matrix = vectorizer.fit_transform(knowledge_texts)
+# Initialize TF-IDF vectorizer
+try:
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+    knowledge_texts = [item["content"] for item in KNOWLEDGE_BASE]
+    tfidf_matrix = vectorizer.fit_transform(knowledge_texts)
+    logger.info("TF-IDF vectorizer initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize TF-IDF vectorizer: {str(e)}")
+    vectorizer = None
+    tfidf_matrix = None
 
 def find_relevant_context(query: str, top_k: int = 3) -> List[Dict]:
     """Find most relevant knowledge base entries for the query"""
-    query_vector = vectorizer.transform([query])
-    similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+    if not vectorizer or tfidf_matrix is None:
+        return []
     
-    # Get top-k most similar documents
-    top_indices = similarities.argsort()[-top_k:][::-1]
-    
-    relevant_contexts = []
-    for idx in top_indices:
-        if similarities[idx] > 0.1:  # Threshold for relevance
-            relevant_contexts.append({
-                "content": KNOWLEDGE_BASE[idx]["content"],
-                "category": KNOWLEDGE_BASE[idx]["category"],
-                "similarity": float(similarities[idx])
-            })
-    
-    return relevant_contexts
+    try:
+        query_vector = vectorizer.transform([query])
+        similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+        
+        top_indices = similarities.argsort()[-top_k:][::-1]
+        
+        relevant_contexts = []
+        for idx in top_indices:
+            if similarities[idx] > 0.1:
+                relevant_contexts.append({
+                    "content": KNOWLEDGE_BASE[idx]["content"],
+                    "category": KNOWLEDGE_BASE[idx]["category"],
+                    "similarity": float(similarities[idx])
+                })
+        
+        return relevant_contexts
+    except Exception as e:
+        logger.error(f"Error finding relevant context: {str(e)}")
+        return []
 
 def generate_response(query: str, contexts: List[Dict]) -> str:
     """Generate response using Groq with retrieved contexts"""
+    if not client:
+        return "I apologize, but the AI service is currently unavailable. Please contact our team directly for assistance with G1SOW Studio's services."
     
-    # Prepare context for the prompt
     context_text = "\n\n".join([ctx["content"] for ctx in contexts])
     
     system_prompt = """You are a helpful assistant for G1SOW Studio, a digital agency specializing in AI-powered web development. 
@@ -142,20 +165,18 @@ def generate_response(query: str, contexts: List[Dict]) -> str:
 
 @app.get("/")
 async def root():
-    return {"message": "G1SOW Studio RAG Chatbot API is running!"}
+    return {"message": "G1SOW Studio RAG Chatbot API is running!", "status": "healthy"}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Main chat endpoint"""
     try:
-        # Find relevant context
         relevant_contexts = find_relevant_context(request.message)
         
         if not relevant_contexts:
             response_text = "I don't have specific information about that topic. For detailed information about G1SOW Studio's services, please visit our website or contact our team directly."
             sources = []
         else:
-            # Generate response using Groq
             response_text = generate_response(request.message, relevant_contexts)
             sources = [ctx["category"] for ctx in relevant_contexts]
         
@@ -171,7 +192,12 @@ async def chat(request: ChatRequest):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "G1SOW Studio RAG Chatbot"}
+    return {
+        "status": "healthy", 
+        "service": "G1SOW Studio RAG Chatbot",
+        "groq_client": "connected" if client else "disconnected",
+        "vectorizer": "initialized" if vectorizer else "failed"
+    }
 
 if __name__ == "__main__":
     import uvicorn
